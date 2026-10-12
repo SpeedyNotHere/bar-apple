@@ -1,182 +1,205 @@
-from PIL import Image
+
 import cv2
+import numpy as np
 import barcode
 from barcode.writer import ImageWriter
-import io
-import numpy as np
+from PIL import Image
+import os
 
-print("hello")
+INPUT_VIDEO = "bad_apple_for_comparison.mp4"
+OUTPUT_VIDEO = "bad_apple_barcodes.mp4"
 
-video = cv2.VideoCapture("bad_apple_for_comparison.mp4")
+# output settings
+OUTPUT_WIDTH = 960
+OUTPUT_HEIGHT = 720
 
-if not video.isOpened():
-    print("failed to open bad_apple_for_comparison.mp4")
-    raise SystemExit
+# image sampling settings
+# every other vertical pixel is scanned before resizing
+SAMPLE_WIDTH = 12
+SAMPLE_HEIGHT = 12
 
-# settings
-fps = 60
-start_frame = 81
-max_frames = fps * 15
-output_size = (960, 300)
-bar_count = 180
-section_count = 12
-module_width = 0.25
+# black-and-white contrast
+THRESHOLD = 128
 
-# start at frame 81
-video.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+# barcode rendering settings
+BARCODE_MODULE_WIDTH = 0.5
+BARCODE_MODULE_HEIGHT = 30
+BARCODE_DPI = 150
 
-success, frame = video.read()
-if not success:
-    print("failed to read the starting frame")
-    video.release()
-    raise SystemExit
+# 0.0 = no smoothing; higher values create more smoothing
+TEMPORAL_SMOOTHING = 0.10
 
-print(f"source frame shape: {frame.shape}")
 
-# start processing from frame 81
-video.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-writer = cv2.VideoWriter(
-    "bad_apple_barcodes.mp4",
-    cv2.VideoWriter_fourcc(*"mp4v"),
-    fps,
-    output_size
-)
-
-if not writer.isOpened():
-    print("failed to create output video")
-    video.release()
-    raise SystemExit
-
-frame_count = 0
-
-while frame_count < max_frames:
-    success, frame = video.read()
-    if not success:
-        break
-
-    # convert source frame to grayscale
+def frame_to_code128(frame, previous_samples):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # improve local contrast
-    gray = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
-    ).apply(gray)
+    # scan every other vertical pixel
+    gray = gray[::2, :]
 
-    # otsu thresholding
-    _, binary = cv2.threshold(
+    # resize to a fixed-size image representation
+    small = cv2.resize(
         gray,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    # adaptive thresholding helps capture smaller local details
-    adaptive = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        21,
-        5
-    )
-
-    # combine global and local detail
-    combined = cv2.bitwise_and(binary, adaptive)
-
-    # reduce the frame into a grid while retaining vertical detail
-    small_binary = cv2.resize(
-        combined,
-        (bar_count, section_count),
+        (SAMPLE_WIDTH, SAMPLE_HEIGHT),
         interpolation=cv2.INTER_AREA
     )
 
-    _, small_binary = cv2.threshold(
-        small_binary,
-        127,
+    # smooth changes between consecutive frames
+    if previous_samples is not None and TEMPORAL_SMOOTHING > 0:
+        small = cv2.addWeighted(
+            small,
+            1.0 - TEMPORAL_SMOOTHING,
+            previous_samples,
+            TEMPORAL_SMOOTHING,
+            0
+        )
+
+    previous_samples = small.copy()
+
+    # force the sampled pixels to pure black or white
+    _, binary = cv2.threshold(
+        small,
+        THRESHOLD,
         255,
         cv2.THRESH_BINARY
     )
 
-    # encode each grid row as a string of 0s and 1s
-    # use every row so vertical details affect the encoded data
-    pixel_data = ""
+    # encode the binary pixels as 0s and 1s
+    bits = (binary == 0).astype(np.uint8).flatten()
 
-    for y in range(section_count):
-        for x in range(bar_count):
-            pixel_data += "1" if small_binary[y, x] < 128 else "0"
+    # pack six pixels into each printable character
+    # each character represents six sampled black/white pixels
+    payload = []
 
-    # Code 128 supports text data, not arbitrary image pixels.
-    # Encoding the binary grid as text gives the barcode a changing pattern.
+    for start in range(0, len(bits), 6):
+        chunk = bits[start:start + 6]
+        value = 0
+
+        for bit in chunk:
+            value = (value << 1) | int(bit)
+
+        payload.append(chr(32 + value))
+
+    return "".join(payload), previous_samples
+
+
+def render_barcode(payload):
     code128 = barcode.get(
         "code128",
-        pixel_data,
+        payload,
         writer=ImageWriter()
     )
 
-    buffer = io.BytesIO()
-
-    code128.write(buffer, options={
-        "write_text": False,
-        "module_width": module_width,
-        "module_height": 30,
+    options = {
+        "module_width": BARCODE_MODULE_WIDTH,
+        "module_height": BARCODE_MODULE_HEIGHT,
         "quiet_zone": 2,
-        "font_size": 0,
-        "text_distance": 0
-    })
+        "font_size": 1,
+        "text_distance": 1,
+        "write_text": False,
+        "dpi": BARCODE_DPI,
+        "background": "white",
+        "foreground": "black"
+    }
 
-    buffer.seek(0)
-    barcode_image = Image.open(buffer).convert("RGB")
+    return code128.render(options).convert("RGB")
 
-    # invert barcode colors
-    barcode_array = 255 - np.array(barcode_image)
 
-    # create barcode-only output canvas
-    canvas = np.full(
-        (output_size[1], output_size[0], 3),
-        255,
-        dtype=np.uint8
+def main():
+    if not os.path.exists(INPUT_VIDEO):
+        print(f"Error: could not find {INPUT_VIDEO}")
+        return
+
+    cap = cv2.VideoCapture(INPUT_VIDEO)
+
+    if not cap.isOpened():
+        print("Error: could not open the input video.")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 30.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(
+        OUTPUT_VIDEO,
+        fourcc,
+        fps,
+        (OUTPUT_WIDTH, OUTPUT_HEIGHT)
     )
 
-    # fit barcode into output without cropping
-    h, w = barcode_array.shape[:2]
+    if not writer.isOpened():
+        print("Error: could not create the output video.")
+        cap.release()
+        return
 
-    scale = min(
-        output_size[1] / h,
-        output_size[0] / w
-    )
+    previous_samples = None
+    frame_number = 0
 
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
+    try:
+        while True:
+            success, frame = cap.read()
 
-    barcode_array = cv2.resize(
-        barcode_array,
-        (new_w, new_h),
-        interpolation=cv2.INTER_NEAREST
-    )
+            if not success:
+                break
 
-    x_offset = (output_size[0] - new_w) // 2
-    y_offset = (output_size[1] - new_h) // 2
+            payload, previous_samples = frame_to_code128(
+                frame,
+                previous_samples
+            )
 
-    canvas[
-        y_offset:y_offset + new_h,
-        x_offset:x_offset + new_w
-    ] = cv2.cvtColor(
-        barcode_array,
-        cv2.COLOR_RGB2BGR
-    )
+            barcode_image = render_barcode(payload)
 
-    # write only the barcode frame; never overlay the source video
-    writer.write(canvas)
+            # keep the barcode inside the output frame
+            barcode_image.thumbnail(
+                (OUTPUT_WIDTH - 20, OUTPUT_HEIGHT - 20),
+                Image.Resampling.LANCZOS
+            )
 
-    buffer.close()
-    frame_count += 1
+            # white background
+            canvas = Image.new(
+                "RGB",
+                (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+                "white"
+            )
 
-    print(f"processed {frame_count}/{max_frames}")
+            # center the single continuous barcode
+            x = (OUTPUT_WIDTH - barcode_image.width) // 2
+            y = (OUTPUT_HEIGHT - barcode_image.height) // 2
+            canvas.paste(barcode_image, (x, y))
 
-writer.release()
-video.release()
-cv2.destroyAllWindows()
+            writer.write(
+                cv2.cvtColor(
+                    np.array(canvas),
+                    cv2.COLOR_RGB2BGR
+                )
+            )
 
-print("saved bad_apple_barcodes.mp4")
+            frame_number += 1
+
+            if frame_number % 30 == 0:
+                if total_frames > 0:
+                    percent = frame_number / total_frames * 100
+                    print(
+                        f"\rProgress: {percent:.1f}% "
+                        f"({frame_number}/{total_frames} frames)",
+                        end="",
+                        flush=True
+                    )
+                else:
+                    print(
+                        f"\rProcessed {frame_number} frames",
+                        end="",
+                        flush=True
+                    )
+
+    finally:
+        cap.release()
+        writer.release()
+
+    print(f"\nDone! Saved as {OUTPUT_VIDEO}")
+
+
+if __name__ == "__main__":
+    main()
